@@ -26,13 +26,13 @@ from aiogram.types import (
 )
 
 # =========================================================
-#   CONFIGURATION (Railway)
+#   CONFIGURATION
 # =========================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8502686983"))
+BOT_TOKEN = "8688447065:AAE5E2l4qbgm0jwLW9bIxS3olFIfzvvuDBc"
+ADMIN_ID = 8502686983
 
-# Railway persistent storage path
-DB_PATH = os.getenv("DB_PATH", "/app/data/earnbot.db")
+# Database path
+DB_PATH = "earnbot.db"
 
 REQUIRED_CHANNELS = [
     {"chat_id": "@NeroxaOfficial", "title": "Neroxa Official", "url": "https://t.me/NeroxaOfficial"},
@@ -49,10 +49,6 @@ log = logging.getLogger("earnbot")
 #   DATABASE
 # =========================================================
 def db():
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir and not os.path.exists(db_dir):
-        os.makedirs(db_dir, exist_ok=True)
-    
     con = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL;")
@@ -160,8 +156,19 @@ def db_init():
             value TEXT,
             description TEXT DEFAULT ''
         );
+
+        CREATE TABLE IF NOT EXISTS bot_stats(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            total_users INTEGER,
+            active_users INTEGER,
+            coins_in_circulation INTEGER,
+            stars_in_circulation INTEGER,
+            vip_users INTEGER
+        );
         """)
 
+        # Default settings
         defaults = {
             "max_energy": ("100", "Maximum energy for regular users"),
             "energy_regen_min": ("5", "Minutes to regenerate 1 energy"),
@@ -183,10 +190,13 @@ def db_init():
             "vip_price_stars": ("100", "VIP price in stars"),
             "vip_days": ("30", "VIP duration in days"),
             "vip_daily_bonus": ("100", "VIP daily bonus"),
+            "bot_name": ("Premium Earn Bot", "Bot display name"),
+            "welcome_message": ("Welcome to {bot_name}! 🎉\nEarn coins and rewards daily!", "Welcome message template"),
         }
         for k, (v, desc) in defaults.items():
             con.execute("INSERT OR IGNORE INTO settings(key,value,description) VALUES(?,?,?)", (k, v, desc))
 
+        # Seed shop
         if con.execute("SELECT COUNT(*) FROM shop_items").fetchone()[0] == 0:
             con.executemany(
                 "INSERT INTO shop_items(name,kind,price,payload,description) VALUES(?,?,?,?,?)",
@@ -195,9 +205,11 @@ def db_init():
                     ("🎡 Spin Ticket x5", "spin", 3, "5", "Get 5 lucky spin tickets"),
                     ("👑 VIP 30 Days", "vip", 100, "30", "Get VIP access for 30 days"),
                     ("🚀 VIP 7 Days", "vip", 50, "7", "Get VIP access for 7 days"),
+                    ("💰 Coin Booster x2", "booster", 20, "2", "Double coins from tasks for 1 hour"),
                 ],
             )
         
+        # Add sample tasks
         con.execute("""
             INSERT OR IGNORE INTO tasks(id, kind, title, url, chat_id, coin_reward, star_reward, xp_reward, energy_cost, cooldown_s, daily_limit, min_level, active, vip_only, description)
             VALUES 
@@ -278,17 +290,24 @@ def tr(lang: str, key: str, **kw) -> str:
     s = T.get(lang, T["en"]).get(key) or T["en"].get(key, key)
     return s.format(**kw) if kw else s
 
+# =========================================================
+#   USER UTILITIES
+# =========================================================
 def now_ts() -> int: 
     return int(time.time())
 
 def today() -> str:  
     return datetime.utcnow().strftime("%Y-%m-%d")
 
-def get_user(uid: int):
+def get_user(uid: int) -> Optional[sqlite3.Row]:
     with closing(db()) as con:
         return con.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
 
-def upsert_user(msg_or_cb):
+def get_all_users() -> list:
+    with closing(db()) as con:
+        return con.execute("SELECT * FROM users ORDER BY coins DESC").fetchall()
+
+def upsert_user(msg_or_cb) -> sqlite3.Row:
     u = msg_or_cb.from_user
     with closing(db()) as con:
         existing = con.execute("SELECT user_id FROM users WHERE user_id=?", (u.id,)).fetchone()
@@ -364,23 +383,31 @@ def is_vip(uid: int) -> bool:
             return False
     return u["vip"] == 1
 
-async def check_joined(bot: Bot, uid: int):
+# =========================================================
+#   FORCE-JOIN VERIFICATION
+# =========================================================
+async def check_joined(bot: Bot, uid: int) -> tuple[bool, list]:
     missing = []
     for c in REQUIRED_CHANNELS:
         try:
             m = await bot.get_chat_member(c["chat_id"], uid)
             if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
                 missing.append(c)
-        except:
+        except TelegramBadRequest:
+            missing.append(c)
+        except Exception:
             missing.append(c)
     return len(missing) == 0, missing
 
-def join_kb(missing):
+def join_kb(missing) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=f"📢 ᴊᴏɪɴ • {c['title']}", url=c["url"])] for c in missing]
     rows.append([InlineKeyboardButton(text="✅ ɪ ʜᴀᴠᴇ ᴊᴏɪɴᴇᴅ ✓", callback_data="check_join")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def main_menu_kb(lang="en", admin=False, vip=False):
+# =========================================================
+#   KEYBOARDS
+# =========================================================
+def main_menu_kb(lang="en", admin=False, vip=False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="👤 ᴘʀᴏғɪʟᴇ",  callback_data="profile"),
          InlineKeyboardButton(text="👛 ᴡᴀʟʟᴇᴛ",   callback_data="wallet")],
@@ -401,7 +428,7 @@ def main_menu_kb(lang="en", admin=False, vip=False):
         rows.insert(2, [InlineKeyboardButton(text="👑 ɢᴇᴛ ᴠɪᴘ", callback_data="vip")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def back_kb(cb="menu", label="⬅️ Back"):
+def back_kb(cb="menu", label="⬅️ Back") -> InlineKeyboardMarkup:
     if cb == "menu":
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🏠 Main Menu", callback_data="menu")]
@@ -411,7 +438,7 @@ def back_kb(cb="menu", label="⬅️ Back"):
          InlineKeyboardButton(text="🏠 Main Menu", callback_data="menu")]
     ])
 
-def menu_text(user, lang="en"):
+def menu_text(user, lang="en") -> str:
     vip_status = "✅ Active" if user["vip"] else "❌ No"
     return tr(lang, "menu",
               name=user["first_name"] or user["username"] or "User",
@@ -419,45 +446,22 @@ def menu_text(user, lang="en"):
               energy=user["energy"], lvl=user["level"],
               vip_status=vip_status)
 
+# =========================================================
+#   LANGUAGE SELECTION STATE
+# =========================================================
 class LangState(StatesGroup):
     waiting = State()
 
+# =========================================================
+#   USER SEARCH STATE
+# =========================================================
 class AdminUserState(StatesGroup):
     searching = State()
     editing = State()
 
-class TapState(StatesGroup): 
-    playing = State()
-
-class WithdrawState(StatesGroup):
-    method = State()
-    amount = State()
-    number = State()
-    confirm = State()
-
-class AddTaskState(StatesGroup):
-    title = State()
-    reward = State()
-    energy = State()
-    limit = State()
-
-class AddItemState(StatesGroup):
-    name = State()
-    kind = State()
-    price = State()
-    payload = State()
-
-class EditSettingState(StatesGroup):
-    key = State()
-    value = State()
-
-class BcStateAdmin(StatesGroup):
-    waiting = State()
-
-class BonusState(StatesGroup):
-    amount = State()
-    action = State()
-
+# =========================================================
+#   ROUTERS
+# =========================================================
 router = Router()
 admin_router = Router()
 
@@ -466,8 +470,10 @@ admin_router = Router()
 async def start_handler(msg: Message, state: FSMContext, bot: Bot):
     await state.clear()
     
+    # Check if user has language selected
     user = upsert_user(msg)
     
+    # Handle referral
     args = msg.text.split()
     if len(args) > 1 and args[1].startswith("ref_"):
         ref_id = int(args[1].split("_")[1])
@@ -479,7 +485,7 @@ async def start_handler(msg: Message, state: FSMContext, bot: Bot):
                     con.execute("UPDATE users SET ref_count=ref_count+1 WHERE user_id=?", (ref_id,))
                     add_balance(ref_id, coins=s_geti("ref_coin", 100), stars=s_geti("ref_star", 1), xp=s_geti("ref_xp", 20), note="Referral reward")
                     try:
-                        await bot.send_message(ref_id, "🎁 You got a referral reward!")
+                        await bot.send_message(ref_id, tr(get_user(ref_id)["lang"] if get_user(ref_id) else "en", "ref_ok"))
                     except:
                         pass
     
@@ -495,6 +501,7 @@ async def start_handler(msg: Message, state: FSMContext, bot: Bot):
     if user["banned"]:
         return await msg.answer(tr(user["lang"], "banned"))
     
+    # Force join check
     ok, missing = await check_joined(bot, msg.from_user.id)
     if missing and not is_admin(msg.from_user.id):
         return await msg.answer(tr(user["lang"], "welcome"),
@@ -512,6 +519,7 @@ async def set_language(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.answer(tr(lang, "lang_set"), show_alert=True)
     
+    # Now check force join
     ok, missing = await check_joined(cb.bot, cb.from_user.id)
     if missing and not is_admin(cb.from_user.id):
         return await cb.message.edit_text(tr(lang, "welcome"),
@@ -547,6 +555,7 @@ async def menu_cb(cb: CallbackQuery, state: FSMContext):
         await cb.message.answer(text, reply_markup=kb)
     await cb.answer()
 
+# ---------- Profile ----------
 @router.callback_query(F.data == "profile")
 async def profile_cb(cb: CallbackQuery):
     user = upsert_user(cb)
@@ -565,6 +574,7 @@ async def profile_cb(cb: CallbackQuery):
     await cb.message.edit_text(text, reply_markup=back_kb())
     await cb.answer()
 
+# ---------- Wallet ----------
 @router.callback_query(F.data == "wallet")
 async def wallet_cb(cb: CallbackQuery):
     user = upsert_user(cb)
@@ -586,10 +596,12 @@ async def wallet_cb(cb: CallbackQuery):
     await cb.message.edit_text(txt, reply_markup=back_kb())
     await cb.answer()
 
+# ---------- Earn Center (VIP only) ----------
 @router.callback_query(F.data == "earn")
 async def earn_cb(cb: CallbackQuery):
     user = upsert_user(cb)
     
+    # Check if user is VIP
     if not is_vip(cb.from_user.id):
         return await cb.answer(tr(user["lang"], "vip_only"), show_alert=True)
     
@@ -604,6 +616,7 @@ async def earn_cb(cb: CallbackQuery):
                                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await cb.answer()
 
+# ---------- Task list (VIP only) ----------
 @router.callback_query(F.data.startswith("t_kind_"))
 async def task_list_cb(cb: CallbackQuery):
     user = upsert_user(cb)
@@ -641,6 +654,7 @@ async def task_open(cb: CallbackQuery, bot: Bot):
     if not t: 
         return await cb.answer("Task not found.", show_alert=True)
 
+    # Daily limit
     with closing(db()) as con:
         done_today = con.execute(
             "SELECT COUNT(*) FROM completed_tasks WHERE user_id=? AND task_id=? AND day=?",
@@ -671,6 +685,7 @@ async def task_open(cb: CallbackQuery, bot: Bot):
                     show_alert=True)
     await earn_cb(cb)
 
+# ---------- Daily / Streak / Mystery (VIP bonus) ----------
 @router.callback_query(F.data == "daily")
 async def daily_cb(cb: CallbackQuery):
     user = upsert_user(cb)
@@ -729,6 +744,7 @@ async def daily_chest(cb: CallbackQuery):
     await cb.answer(f"💰 Chest: +{coin}💰 +{star}⭐", show_alert=True)
     await daily_cb(cb)
 
+# ---------- Games ----------
 @router.callback_query(F.data == "games")
 async def games_cb(cb: CallbackQuery):
     upsert_user(cb)
@@ -799,6 +815,9 @@ async def g_flip(cb: CallbackQuery):
         add_balance(cb.from_user.id, coins=win, note="Coin flip")
     await cb.answer(f"🪙 +{win}💰" if win else "🪙 Tails! No reward.", show_alert=True)
 
+class TapState(StatesGroup): 
+    playing = State()
+
 @router.callback_query(F.data == "g_tap")
 async def g_tap(cb: CallbackQuery, state: FSMContext):
     user = upsert_user(cb)
@@ -841,6 +860,7 @@ async def tap_end(cb: CallbackQuery, state: FSMContext):
                                reply_markup=back_kb("games"))
     await cb.answer()
 
+# ---------- Referral ----------
 @router.callback_query(F.data == "ref")
 async def ref_cb(cb: CallbackQuery, bot: Bot):
     user = upsert_user(cb)
@@ -881,6 +901,7 @@ async def lb_cb(cb: CallbackQuery):
     await cb.message.edit_text(txt, reply_markup=back_kb("ref"))
     await cb.answer()
 
+# ---------- Shop ----------
 @router.callback_query(F.data == "shop")
 async def shop_cb(cb: CallbackQuery):
     user = upsert_user(cb)
@@ -929,6 +950,7 @@ async def buy_cb(cb: CallbackQuery):
         await cb.answer("✅ Purchase complete.", show_alert=True)
     await shop_cb(cb)
 
+# ---------- VIP ----------
 @router.callback_query(F.data == "vip")
 async def vip_cb(cb: CallbackQuery):
     user = upsert_user(cb)
@@ -949,6 +971,13 @@ async def vip_cb(cb: CallbackQuery):
             [InlineKeyboardButton(text="🏠 Main Menu",     callback_data="menu")]]
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await cb.answer()
+
+# ---------- Withdraw ----------
+class WithdrawState(StatesGroup):
+    method = State()
+    amount = State()
+    number = State()
+    confirm = State()
 
 @router.callback_query(F.data == "withdraw")
 async def withdraw_cb(cb: CallbackQuery, state: FSMContext):
@@ -1052,6 +1081,7 @@ async def wd_submit(cb: CallbackQuery, state: FSMContext, bot: Bot):
         pass
     await cb.answer()
 
+# ---------- Language ----------
 @router.callback_query(F.data == "lang")
 async def lang_cb(cb: CallbackQuery):
     upsert_user(cb)
@@ -1080,6 +1110,7 @@ async def setlang_cb(cb: CallbackQuery, state: FSMContext):
     except TelegramBadRequest:
         await cb.message.answer(text, reply_markup=kb)
 
+# ---------- Support ----------
 @router.callback_query(F.data == "support")
 async def support_cb(cb: CallbackQuery):
     upsert_user(cb)
@@ -1092,9 +1123,9 @@ async def support_cb(cb: CallbackQuery):
     await cb.answer()
 
 # =========================================================
-#   ADMIN PANEL
+#   ADVANCED ADMIN PANEL
 # =========================================================
-def admin_kb():
+def admin_kb() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="📊 Dashboard", callback_data="a_dashboard")],
         [InlineKeyboardButton(text="👥 User Management", callback_data="a_users")],
@@ -1114,6 +1145,7 @@ async def admin_cb(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): 
         return await cb.answer("⛔ Access Denied! Only bot owner can access admin panel.", show_alert=True)
     
+    # Get quick stats
     with closing(db()) as con:
         total_users = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         active_today = con.execute("SELECT COUNT(*) FROM users WHERE last_active=?", (today(),)).fetchone()[0]
@@ -1132,6 +1164,7 @@ async def admin_cb(cb: CallbackQuery):
     await cb.message.edit_text(text, reply_markup=admin_kb())
     await cb.answer()
 
+# ---------- Dashboard ----------
 @admin_router.callback_query(F.data == "a_dashboard")
 async def admin_dashboard(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return
@@ -1143,6 +1176,8 @@ async def admin_dashboard(cb: CallbackQuery):
         total_tasks = con.execute("SELECT COUNT(*) FROM completed_tasks").fetchone()[0]
         total_withdrawn = con.execute("SELECT SUM(amount) FROM withdrawals WHERE status='approved'").fetchone()[0] or 0
         total_referrals = con.execute("SELECT SUM(ref_count) FROM users").fetchone()[0] or 0
+        
+        # Daily stats
         new_today = con.execute("SELECT COUNT(*) FROM users WHERE join_date=?", (today(),)).fetchone()[0]
         active_today = con.execute("SELECT COUNT(*) FROM users WHERE last_active=?", (today(),)).fetchone()[0]
         tasks_today = con.execute("SELECT COUNT(*) FROM completed_tasks WHERE day=?", (today(),)).fetchone()[0]
@@ -1160,7 +1195,8 @@ async def admin_dashboard(cb: CallbackQuery):
             f"<b>📅 TODAY'S STATS</b>\n"
             f"├ 🆕 New Users: {new_today}\n"
             f"├ 🌟 Active Users: {active_today}\n"
-            f"└ ✅ Tasks Completed: {tasks_today}\n\n"
+            f"├ ✅ Tasks Completed: {tasks_today}\n"
+            f"└ 🎯 Completion Rate: {round((tasks_today/max(1,active_today))*100, 1)}%\n\n"
             f"<b>━━━━━━━━━━━━━━━━━━</b>\n"
             f"<b>🔧 SYSTEM INFO</b>\n"
             f"├ 🤖 Bot Version: 2.0.0\n"
@@ -1174,6 +1210,7 @@ async def admin_dashboard(cb: CallbackQuery):
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
 
+# ---------- User Management ----------
 @admin_router.callback_query(F.data == "a_users")
 async def admin_users(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return
@@ -1199,6 +1236,8 @@ async def admin_users(cb: CallbackQuery):
     rows = [
         [InlineKeyboardButton(text="🔍 Search User", callback_data="a_search_user")],
         [InlineKeyboardButton(text="📊 Top Users", callback_data="a_top_users")],
+        [InlineKeyboardButton(text="🚫 Banned Users", callback_data="a_banned_users")],
+        [InlineKeyboardButton(text="👑 VIP Users", callback_data="a_vip_users")],
         [InlineKeyboardButton(text="⬅️ Back", callback_data="admin")]
     ]
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -1210,8 +1249,8 @@ async def admin_search_user(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AdminUserState.searching)
     await cb.message.edit_text(
         "🔍 <b>Search User</b>\n\n"
-        "Send the user's ID or username:\n"
-        "Example: <code>123456789</code> or <code>username</code>",
+        "Send the user's ID or username (with or without @):\n"
+        "Example: <code>123456789</code> or <code>@username</code>",
         reply_markup=back_kb("a_users"))
     await cb.answer()
 
@@ -1222,26 +1261,36 @@ async def admin_search_result(msg: Message, state: FSMContext):
     query = msg.text.strip()
     user_id = None
     
-    try:
-        user_id = int(query)
-    except:
+    if query.startswith("@"):
+        # Search by username
+        username = query[1:]
         with closing(db()) as con:
-            row = con.execute("SELECT * FROM users WHERE username LIKE ?", (f"%{query}%",)).fetchone()
+            row = con.execute("SELECT * FROM users WHERE username LIKE ?", (f"%{username}%",)).fetchone()
             if row:
                 user_id = row["user_id"]
+    else:
+        try:
+            user_id = int(query)
+        except:
+            pass
     
     if not user_id:
-        await msg.answer("❌ User not found.", reply_markup=back_kb("a_users"))
+        await msg.answer("❌ User not found. Try again with correct ID or username.", reply_markup=back_kb("a_users"))
         return
     
+    await state.clear()
+    await show_user_details(msg, user_id, state)
+
+async def show_user_details(msg: Message, user_id: int, state: FSMContext):
     user = get_user(user_id)
     if not user:
-        await msg.answer("❌ User not found.", reply_markup=back_kb("a_users"))
+        await msg.answer("❌ User not found!")
         return
     
     with closing(db()) as con:
         ref_count = con.execute("SELECT COUNT(*) FROM referrals WHERE ref_id=?", (user_id,)).fetchone()[0]
         tasks_done = con.execute("SELECT COUNT(*) FROM completed_tasks WHERE user_id=?", (user_id,)).fetchone()[0]
+        total_earned = con.execute("SELECT SUM(coins) FROM transactions WHERE user_id=? AND amount>0", (user_id,)).fetchone()[0] or 0
     
     text = (f"👤 <b>USER DETAILS</b>\n\n"
             f"🆔 <b>ID:</b> <code>{user['user_id']}</code>\n"
@@ -1254,29 +1303,31 @@ async def admin_search_result(msg: Message, state: FSMContext):
             f"⭐ <b>Stars:</b> {user['stars']:,}\n"
             f"⚡ <b>Energy:</b> {user['energy']}\n"
             f"🏆 <b>Level:</b> {user['level']}\n"
+            f"📊 <b>XP:</b> {user['xp']}\n"
             f"👥 <b>Referrals:</b> {ref_count}\n"
             f"✅ <b>Tasks Done:</b> {tasks_done}\n"
+            f"💵 <b>Total Earned:</b> {total_earned:,}\n"
             f"📅 <b>Joined:</b> {user['join_date']}\n"
             f"📱 <b>Last Active:</b> {user['last_active']}")
     
     rows = [
-        [InlineKeyboardButton(text="💰 Add Coins", callback_data=f"usr_add_{user_id}"),
+        [InlineKeyboardButton(text="💰 Add Balance", callback_data=f"usr_add_{user_id}"),
          InlineKeyboardButton(text="⭐ Add Stars", callback_data=f"usr_add_star_{user_id}")],
         [InlineKeyboardButton(text="👑 Toggle VIP", callback_data=f"usr_vip_{user_id}"),
          InlineKeyboardButton(text="🚫 Toggle Ban", callback_data=f"usr_ban_{user_id}")],
+        [InlineKeyboardButton(text="📊 User Stats", callback_data=f"usr_stats_{user_id}"),
+         InlineKeyboardButton(text="💸 Withdrawals", callback_data=f"usr_wd_{user_id}")],
         [InlineKeyboardButton(text="🔙 Back", callback_data="a_users")]
     ]
     await msg.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await state.clear()
 
 @admin_router.callback_query(F.data.startswith("usr_add_"))
-async def admin_add_coins(cb: CallbackQuery, state: FSMContext):
+async def admin_add_balance(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
     user_id = int(cb.data.split("_")[2])
     await state.update_data(target_user=user_id, action="add_coins")
     await state.set_state(AdminUserState.editing)
     await cb.message.answer(f"💰 Enter amount of coins to add to user <code>{user_id}</code>:", reply_markup=back_kb("a_users"))
-    await cb.answer()
 
 @admin_router.callback_query(F.data.startswith("usr_add_star_"))
 async def admin_add_stars(cb: CallbackQuery, state: FSMContext):
@@ -1285,7 +1336,6 @@ async def admin_add_stars(cb: CallbackQuery, state: FSMContext):
     await state.update_data(target_user=user_id, action="add_stars")
     await state.set_state(AdminUserState.editing)
     await cb.message.answer(f"⭐ Enter amount of stars to add to user <code>{user_id}</code>:", reply_markup=back_kb("a_users"))
-    await cb.answer()
 
 @admin_router.callback_query(F.data.startswith("usr_vip_"))
 async def admin_toggle_vip(cb: CallbackQuery):
@@ -1298,9 +1348,7 @@ async def admin_toggle_vip(cb: CallbackQuery):
         with closing(db()) as con:
             con.execute("UPDATE users SET vip=?, vip_until=? WHERE user_id=?", (new_vip, until, user_id))
         await cb.answer(f"✅ VIP {'granted for 30 days' if new_vip else 'revoked'}", show_alert=True)
-    await cb.message.delete()
-    await cb.message.answer("✅ Done!", reply_markup=back_kb("a_users"))
-    await cb.answer()
+    await show_user_details(cb.message, user_id, None)
 
 @admin_router.callback_query(F.data.startswith("usr_ban_"))
 async def admin_toggle_ban(cb: CallbackQuery):
@@ -1309,8 +1357,7 @@ async def admin_toggle_ban(cb: CallbackQuery):
     with closing(db()) as con:
         con.execute("UPDATE users SET banned=1-banned WHERE user_id=?", (user_id,))
     await cb.answer("✅ Ban status toggled", show_alert=True)
-    await cb.message.delete()
-    await cb.message.answer("✅ Done!", reply_markup=back_kb("a_users"))
+    await show_user_details(cb.message, user_id, None)
 
 @admin_router.message(AdminUserState.editing)
 async def admin_process_edit(msg: Message, state: FSMContext):
@@ -1334,30 +1381,9 @@ async def admin_process_edit(msg: Message, state: FSMContext):
         await msg.answer(f"✅ Added {amount}⭐ stars to user <code>{user_id}</code>")
     
     await state.clear()
-    await msg.answer("Returning to user management...", reply_markup=back_kb("a_users"))
+    await show_user_details(msg, user_id, state)
 
-@admin_router.callback_query(F.data == "a_top_users")
-async def admin_top_users(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id): return
-    
-    with closing(db()) as con:
-        top_coins = con.execute("SELECT user_id, first_name, username, coins FROM users ORDER BY coins DESC LIMIT 10").fetchall()
-        top_stars = con.execute("SELECT user_id, first_name, username, stars FROM users ORDER BY stars DESC LIMIT 10").fetchall()
-    
-    text = "🏆 <b>TOP USERS</b>\n\n"
-    text += "💰 <b>Richest (Coins):</b>\n"
-    for i, u in enumerate(top_coins[:5], 1):
-        name = u['first_name'] or u['username'] or str(u['user_id'])
-        text += f"{i}. {name[:20]}: {u['coins']:,}💰\n"
-    
-    text += "\n⭐ <b>Richest (Stars):</b>\n"
-    for i, u in enumerate(top_stars[:5], 1):
-        name = u['first_name'] or u['username'] or str(u['user_id'])
-        text += f"{i}. {name[:20]}: {u['stars']:,}⭐\n"
-    
-    await cb.message.edit_text(text, reply_markup=back_kb("a_users"))
-    await cb.answer()
-
+# ---------- Bonus Management ----------
 @admin_router.callback_query(F.data == "a_bonus")
 async def admin_bonus(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return
@@ -1365,6 +1391,7 @@ async def admin_bonus(cb: CallbackQuery):
     rows = [
         [InlineKeyboardButton(text="🎁 Give Bonus to All Users", callback_data="a_bonus_all")],
         [InlineKeyboardButton(text="👑 Give Bonus to VIP Users", callback_data="a_bonus_vip")],
+        [InlineKeyboardButton(text="📊 Give Bonus by Level", callback_data="a_bonus_level")],
         [InlineKeyboardButton(text="⬅️ Back", callback_data="admin")]
     ]
     await cb.message.edit_text(
@@ -1378,13 +1405,16 @@ async def admin_bonus(cb: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await cb.answer()
 
+class BonusState(StatesGroup):
+    amount = State()
+    action = State()
+
 @admin_router.callback_query(F.data == "a_bonus_all")
 async def admin_bonus_all(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
     await state.update_data(bonus_type="all")
     await state.set_state(BonusState.amount)
     await cb.message.answer("💰 Enter amount of coins to give to ALL users:", reply_markup=back_kb("a_bonus"))
-    await cb.answer()
 
 @admin_router.callback_query(F.data == "a_bonus_vip")
 async def admin_bonus_vip(cb: CallbackQuery, state: FSMContext):
@@ -1392,7 +1422,6 @@ async def admin_bonus_vip(cb: CallbackQuery, state: FSMContext):
     await state.update_data(bonus_type="vip")
     await state.set_state(BonusState.amount)
     await cb.message.answer("💰 Enter amount of coins to give to VIP users:", reply_markup=back_kb("a_bonus"))
-    await cb.answer()
 
 @admin_router.message(BonusState.amount)
 async def admin_process_bonus(msg: Message, state: FSMContext):
@@ -1421,8 +1450,8 @@ async def admin_process_bonus(msg: Message, state: FSMContext):
         await msg.answer(f"✅ Bonus sent! {amount}💰 added to {len(users)} VIP users.")
     
     await state.clear()
-    await msg.answer("Returning to admin panel...", reply_markup=back_kb("admin"))
 
+# ---------- Task Management ----------
 @admin_router.callback_query(F.data == "a_tasks")
 async def admin_tasks(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return
@@ -1434,22 +1463,29 @@ async def admin_tasks(cb: CallbackQuery):
         text = "📋 <b>TASK MANAGEMENT</b>\n\nNo tasks found. Add some tasks!"
     else:
         text = "📋 <b>TASK MANAGEMENT</b>\n\n"
-        for task in tasks[:5]:
+        for task in tasks:
             text += (
                 f"🔸 <b>{task['title']}</b>\n"
                 f"   ├ Reward: +{task['coin_reward']}💰 +{task['star_reward']}⭐ +{task['xp_reward']}🏆\n"
                 f"   ├ Energy: {task['energy_cost']} | Limit: {task['daily_limit']}/day\n"
-                f"   └ Status: {'✅ Active' if task['active'] else '❌ Inactive'}\n\n"
+                f"   ├ Status: {'✅ Active' if task['active'] else '❌ Inactive'}\n"
+                f"   └ VIP Only: {'👑 Yes' if task['vip_only'] else 'Everyone'}\n\n"
             )
-        if len(tasks) > 5:
-            text += f"... and {len(tasks)-5} more tasks\n"
     
     rows = [
         [InlineKeyboardButton(text="➕ Add New Task", callback_data="a_task_add")],
+        [InlineKeyboardButton(text="✏️ Edit Task", callback_data="a_task_edit")],
+        [InlineKeyboardButton(text="❌ Disable/Enable Task", callback_data="a_task_toggle")],
         [InlineKeyboardButton(text="⬅️ Back", callback_data="admin")]
     ]
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await cb.answer()
+
+class AddTaskState(StatesGroup):
+    title = State()
+    reward = State()
+    energy = State()
+    limit = State()
 
 @admin_router.callback_query(F.data == "a_task_add")
 async def admin_add_task(cb: CallbackQuery, state: FSMContext):
@@ -1506,6 +1542,7 @@ async def admin_add_limit(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("✅ Task added successfully!", reply_markup=back_kb("admin"))
 
+# ---------- Shop Management ----------
 @admin_router.callback_query(F.data == "a_shop")
 async def admin_shop(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return
@@ -1516,16 +1553,26 @@ async def admin_shop(cb: CallbackQuery):
     if items:
         text = "🛍 <b>SHOP ITEMS</b>\n\n"
         for item in items:
-            text += f"🔸 <b>{item['name']}</b>\n   ├ Price: {item['price']}⭐\n   ├ Type: {item['kind']}\n   └ Status: {'✅' if item['active'] else '❌'}\n\n"
+            text += f"🔸 <b>{item['name']}</b>\n   ├ Price: {item['price']}⭐\n   ├ Type: {item['kind']}\n   ├ Status: {'✅' if item['active'] else '❌'}"
+            if item['description']:
+                text += f"\n   └ {item['description']}"
+            text += "\n\n"
     else:
         text = "🛍 <b>SHOP MANAGEMENT</b>\n\nNo items found."
     
     rows = [
         [InlineKeyboardButton(text="➕ Add Item", callback_data="a_shop_add")],
+        [InlineKeyboardButton(text="✏️ Edit Item", callback_data="a_shop_edit")],
         [InlineKeyboardButton(text="⬅️ Back", callback_data="admin")]
     ]
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await cb.answer()
+
+class AddItemState(StatesGroup):
+    name = State()
+    kind = State()
+    price = State()
+    payload = State()
 
 @admin_router.callback_query(F.data == "a_shop_add")
 async def admin_add_item(cb: CallbackQuery, state: FSMContext):
@@ -1546,14 +1593,15 @@ async def admin_item_name(msg: Message, state: FSMContext):
         "📦 Select item kind:\n"
         "• <code>energy</code> - Refill energy\n"
         "• <code>vip</code> - VIP subscription\n"
-        "• <code>spin</code> - Spin tickets\n\n"
+        "• <code>spin</code> - Spin tickets\n"
+        "• <code>booster</code> - Other boosters\n\n"
         "Send the kind:")
 
 @admin_router.message(AddItemState.kind)
 async def admin_item_kind(msg: Message, state: FSMContext):
     kind = msg.text.lower()
-    if kind not in ["energy", "vip", "spin"]:
-        await msg.answer("❌ Invalid kind. Choose: energy, vip, or spin")
+    if kind not in ["energy", "vip", "spin", "booster"]:
+        await msg.answer("❌ Invalid kind. Choose: energy, vip, spin, or booster")
         return
     await state.update_data(kind=kind)
     await state.set_state(AddItemState.price)
@@ -1580,6 +1628,7 @@ async def admin_item_payload(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("✅ Shop item added successfully!", reply_markup=back_kb("admin"))
 
+# ---------- Bot Settings ----------
 @admin_router.callback_query(F.data == "a_settings")
 async def admin_settings(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return
@@ -1588,15 +1637,22 @@ async def admin_settings(cb: CallbackQuery):
         settings = con.execute("SELECT * FROM settings ORDER BY key").fetchall()
     
     text = "⚙️ <b>BOT SETTINGS</b>\n\n"
-    for s in settings[:8]:
+    for s in settings[:10]:  # Show first 10
         text += f"🔹 <b>{s['key']}</b>: {s['value']}\n"
+        if s['description']:
+            text += f"   └ {s['description']}\n"
     
     rows = [
         [InlineKeyboardButton(text="✏️ Edit Setting", callback_data="a_setting_edit")],
+        [InlineKeyboardButton(text="🔄 Reset to Defaults", callback_data="a_setting_reset")],
         [InlineKeyboardButton(text="⬅️ Back", callback_data="admin")]
     ]
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await cb.answer()
+
+class EditSettingState(StatesGroup):
+    key = State()
+    value = State()
 
 @admin_router.callback_query(F.data == "a_setting_edit")
 async def admin_edit_setting(cb: CallbackQuery, state: FSMContext):
@@ -1622,7 +1678,7 @@ async def admin_setting_key(msg: Message, state: FSMContext):
     with closing(db()) as con:
         exists = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
         if not exists:
-            await msg.answer("❌ Setting not found.", reply_markup=back_kb("a_settings"))
+            await msg.answer("❌ Setting not found. Try again.", reply_markup=back_kb("a_settings"))
             return
     await state.update_data(setting_key=key, current_value=exists["value"])
     await state.set_state(EditSettingState.value)
@@ -1640,6 +1696,7 @@ async def admin_setting_value(msg: Message, state: FSMContext):
     await msg.answer(f"✅ Setting <b>{data['setting_key']}</b> updated to <b>{new_value}</b>!", 
                      reply_markup=back_kb("admin"))
 
+# ---------- Broadcast ----------
 @admin_router.callback_query(F.data == "a_broadcast")
 async def admin_broadcast(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
@@ -1659,6 +1716,9 @@ async def admin_broadcast(cb: CallbackQuery, state: FSMContext):
         f"⚠️ <b>Warning:</b> This will send to ALL users!",
         reply_markup=back_kb("admin"))
     await cb.answer()
+
+class BcStateAdmin(StatesGroup):
+    waiting = State()
 
 @admin_router.message(BcStateAdmin.waiting)
 async def admin_broadcast_send(msg: Message, state: FSMContext, bot: Bot):
@@ -1697,6 +1757,7 @@ async def admin_broadcast_send(msg: Message, state: FSMContext, bot: Bot):
         f"Message: {msg.text[:100]}...",
         reply_markup=back_kb("admin"))
 
+# ---------- Withdrawals Management ----------
 @admin_router.callback_query(F.data == "a_withdrawals")
 async def admin_withdrawals(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return
@@ -1708,10 +1769,10 @@ async def admin_withdrawals(cb: CallbackQuery):
     
     if pending:
         text = f"💸 <b>WITHDRAWAL REQUESTS</b>\n\n"
-        for w in pending[:5]:
+        for w in pending[:10]:
             text += f"🔹 #{w['id']} | {w['method']} | {w['amount']}৳ | User: <code>{w['user_id']}</code>\n"
-        if len(pending) > 5:
-            text += f"\n... and {len(pending)-5} more\n"
+        if len(pending) > 10:
+            text += f"\n... and {len(pending)-10} more\n"
     else:
         text = "💸 <b>WITHDRAWAL REQUESTS</b>\n\nNo pending withdrawals."
     
@@ -1721,6 +1782,8 @@ async def admin_withdrawals(cb: CallbackQuery):
     
     rows = [
         [InlineKeyboardButton(text="📋 View Pending", callback_data="a_wd_pending")],
+        [InlineKeyboardButton(text="📜 Withdrawal History", callback_data="a_wd_history")],
+        [InlineKeyboardButton(text="⚙️ Withdrawal Settings", callback_data="a_wd_settings")],
         [InlineKeyboardButton(text="⬅️ Back", callback_data="admin")]
     ]
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -1731,7 +1794,7 @@ async def admin_wd_pending(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return
     
     with closing(db()) as con:
-        pending = con.execute("SELECT * FROM withdrawals WHERE status='pending' ORDER BY ts DESC LIMIT 10").fetchall()
+        pending = con.execute("SELECT * FROM withdrawals WHERE status='pending' ORDER BY ts DESC LIMIT 20").fetchall()
     
     if not pending:
         await cb.message.edit_text("✅ No pending withdrawals.", reply_markup=back_kb("a_withdrawals"))
@@ -1795,7 +1858,8 @@ async def admin_wd_approve(cb: CallbackQuery, bot: Bot):
                     f"✅ <b>Withdrawal Approved!</b>\n\n"
                     f"Your withdrawal request #{wid} has been approved!\n"
                     f"💵 Amount: {w['amount']}৳\n"
-                    f"📱 Sent to: {w['number']}")
+                    f"📱 Sent to: {w['number']}\n"
+                    f"⏱️ Please allow 24-48 hours for processing.")
             except:
                 pass
     
@@ -1818,18 +1882,21 @@ async def admin_wd_reject(cb: CallbackQuery, bot: Bot):
                     w["user_id"],
                     f"❌ <b>Withdrawal Rejected</b>\n\n"
                     f"Your withdrawal request #{wid} has been rejected.\n"
-                    f"💵 {w['amount']}৳ has been returned to your balance.")
+                    f"💵 {w['amount']}৳ has been returned to your balance.\n\n"
+                    f"Reason: Please contact admin for details.")
             except:
                 pass
     
     await cb.answer("❌ Withdrawal rejected and coins returned!", show_alert=True)
     await admin_wd_pending(cb)
 
+# ---------- Statistics ----------
 @admin_router.callback_query(F.data == "a_stats")
 async def admin_stats_detail(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return
     
     with closing(db()) as con:
+        # Daily stats for last 7 days
         stats = []
         for i in range(7):
             date = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
@@ -1837,6 +1904,7 @@ async def admin_stats_detail(cb: CallbackQuery):
             tasks_done = con.execute("SELECT COUNT(*) FROM completed_tasks WHERE day=?", (date,)).fetchone()[0]
             stats.append((date, new_users, tasks_done))
         
+        # Top users
         top_coins = con.execute("SELECT user_id, first_name, coins FROM users ORDER BY coins DESC LIMIT 5").fetchall()
         top_stars = con.execute("SELECT user_id, first_name, stars FROM users ORDER BY stars DESC LIMIT 5").fetchall()
     
@@ -1855,7 +1923,12 @@ async def admin_stats_detail(cb: CallbackQuery):
         name = u['first_name'] or str(u['user_id'])
         text += f"├ {i}. {name[:20]}: {u['stars']:,}⭐\n"
     
-    await cb.message.edit_text(text, reply_markup=back_kb("admin"))
+    rows = [
+        [InlineKeyboardButton(text="📊 Export Database", callback_data="a_export")],
+        [InlineKeyboardButton(text="🔄 Reset Stats", callback_data="a_reset_stats")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="admin")]
+    ]
+    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await cb.answer()
 
 # =========================================================
@@ -1867,7 +1940,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(admin_router)
     dp.include_router(router)
-    log.info("🚀 Premium Earn Bot starting on Railway...")
+    log.info("🚀 Premium Earn Bot starting...")
     log.info(f"👑 Admin ID: {ADMIN_ID}")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
